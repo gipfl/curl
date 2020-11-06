@@ -62,6 +62,19 @@ class CurlAsync
     /** @var TimerInterface */
     protected $fastTimer;
 
+    protected $curlOptions = [
+        CURLOPT_HEADER         => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_ENCODING       => 'gzip',
+        CURLOPT_TCP_NODELAY    => true,
+        CURLINFO_HEADER_OUT    => true,
+        CURLOPT_TCP_KEEPALIVE  => 1,
+        CURLOPT_BUFFERSIZE     => 512 * 1024,
+    ];
+
     /**
      * AsyncCurl constructor.
      * @param LoopInterface $loop
@@ -129,17 +142,7 @@ class CurlAsync
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_HTTPHEADER     => $headers,
             CURLOPT_URL            => $url,
-            CURLOPT_HEADER         => true,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_SSL_VERIFYPEER => true,
-            CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_ENCODING       => 'gzip',
-            CURLOPT_TCP_NODELAY    => true,
-            CURLINFO_HEADER_OUT    => true,
-            CURLOPT_TCP_KEEPALIVE  => 1,
-            CURLOPT_BUFFERSIZE     => 512 * 1024,
-        ];
+        ] + $this->curlOptions;
         curl_setopt_array($curl, $opts);
 
         return $curl;
