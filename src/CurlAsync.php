@@ -2,13 +2,13 @@
 
 namespace gipfl\Curl;
 
+use GuzzleHttp\Psr7\Message;
 use GuzzleHttp\Psr7\Request;
 use Psr\Http\Message\RequestInterface;
 use React\EventLoop\LoopInterface;
 use React\EventLoop\TimerInterface;
 use React\Promise\Deferred;
 use RuntimeException;
-use function GuzzleHttp\Psr7\parse_response;
 use function array_shift;
 use function count;
 use function curl_error;
@@ -241,7 +241,7 @@ class CurlAsync
         $content = curl_multi_getcontent($curl);
         curl_multi_remove_handle($handle, $curl);
         if ($completed['result'] === CURLE_OK) {
-            $deferred->resolve(parse_response($content));
+            $deferred->resolve(Message::parseResponse($content));
         } else {
             $deferred->reject(new \Exception(curl_error($curl)));
         }
