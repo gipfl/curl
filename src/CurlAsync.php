@@ -11,6 +11,7 @@ use React\Promise\Deferred;
 use RuntimeException;
 use function array_shift;
 use function count;
+use function curl_close;
 use function curl_error;
 use function curl_multi_add_handle;
 use function curl_multi_close;
@@ -21,7 +22,7 @@ use function curl_multi_init;
 use function curl_multi_remove_handle;
 use function curl_multi_select;
 use function curl_multi_setopt;
-use function React\Promise\resolve;
+use function curl_multi_strerror;
 
 /**
  * This class provides an async CURL abstraction layer fitting into a ReactPHP
@@ -40,18 +41,17 @@ class CurlAsync
     /** @var Deferred[] resourceIdx => Deferred */
     protected $running = [];
 
-    /** @var Deferred[] resourceIdx => Deferred */
+    /** @var [ [0 => resourceIdx, 1 => Deferred], ... ] */
     protected $pending = [];
+
+    /** @var RequestInterface[] resourceIdx => RequestInterface */
+    protected $pendingRequests = [];
 
     /** @var array resourceIdx => resource */
     protected $curl = [];
 
     /** @var int */
     protected $maxParallelRequests = 30;
-
-    protected $maxParallelRequestsPerHost = 3;
-
-    protected $handlesPerHost = [];
 
     /** @var LoopInterface */
     protected $loop;
@@ -62,21 +62,7 @@ class CurlAsync
     /** @var TimerInterface */
     protected $fastTimer;
 
-    protected $curlOptions = [
-        CURLOPT_HEADER         => true,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_ENCODING       => 'gzip',
-        CURLOPT_TCP_NODELAY    => true,
-        CURLINFO_HEADER_OUT    => true,
-        CURLOPT_TCP_KEEPALIVE  => 1,
-        CURLOPT_BUFFERSIZE     => 512 * 1024,
-    ];
-
     /**
-     * AsyncCurl constructor.
      * @param LoopInterface $loop
      */
     public function __construct(LoopInterface $loop)
@@ -92,6 +78,39 @@ class CurlAsync
         }
     }
 
+    public function get($url, $headers = [], $curlOptions = [])
+    {
+        return $this->send(new Request('GET', $url, $headers), $curlOptions);
+    }
+
+    public function post($url, $headers = [], $body = null, $curlOptions = [])
+    {
+        return $this->send(new Request('POST', $url, $headers, $body), $curlOptions);
+    }
+
+    public function head($url, $headers = [])
+    {
+        return $this->send(new Request('HEAD', $url, $headers));
+    }
+
+    public function send(RequestInterface $request, $curlOptions = [])
+    {
+        $curl = CurlHandle::createForRequest($request, $curlOptions);
+        $idx = (int) $curl;
+        $this->curl[$idx] = $curl;
+        $this->pendingRequests[$idx] = $request;
+        $deferred = new Deferred(function () use ($idx) {
+            $this->freeByResourceReference($idx);
+        });
+        $this->pending[] = [$idx, $deferred];
+        $this->loop->futureTick(function () {
+            $this->enablePolling();
+            $this->enqueueNextRequestIfAny();
+        });
+
+        return $deferred->promise();
+    }
+
     /**
      * @param int $max
      * @return $this
@@ -103,72 +122,12 @@ class CurlAsync
         return $this;
     }
 
-    public function send(RequestInterface $request)
+    public function getPendingCurlHandles()
     {
-        $headers = [];
-        foreach ($request->getHeaders() as $name => $values) {
-            foreach ($values as $value) {
-                $headers[] = "$name: $value";
-            }
-        }
-        return $this
-            ->getCurl($request->getMethod(), $request->getUri(), $headers)
-            ->then(function ($curl) {
-                return $this->curlRequest($curl);
-            });
+        return $this->curl;
     }
 
-    public function get($url, $headers = [])
-    {
-        return $this->send(new Request('GET', $url, $headers));
-    }
-
-    protected function getCurl($method, $url, $headers)
-    {
-        $host = parse_url($url, PHP_URL_HOST);
-        if (isset($this->handlesPerHost[$host])) {
-            if (count($this->handlesPerHost[$host]) >= $this->maxParallelRequestsPerHost) {
-                // $deferred = new Deferred()
-            }
-        }
-
-        return resolve($this->createCurl($method, $url, $headers));
-    }
-
-    protected function createCurl($method, $url, $headers)
-    {
-        $curl = curl_init();
-        $opts = [
-            CURLOPT_CUSTOMREQUEST  => $method,
-            CURLOPT_HTTPHEADER     => $headers,
-            CURLOPT_URL            => $url,
-        ] + $this->curlOptions;
-        curl_setopt_array($curl, $opts);
-
-        return $curl;
-    }
-
-    /**
-     * Promise resolves to a ResponseInterface
-     *
-     * @param resource $curl of type curl
-     * @return \React\Promise\Promise
-     */
-    public function curlRequest($curl)
-    {
-        $deferred = new Deferred();
-        $idx = (int) $curl;
-        $this->curl[$idx] = $curl;
-        $this->pending[] = [$idx, $deferred];
-        $this->loop->futureTick(function () {
-            $this->enablePolling();
-            $this->eventuallyEnqueueNextRequest();
-        });
-
-        return $deferred->promise();
-    }
-
-    protected function eventuallyEnqueueNextRequest()
+    protected function enqueueNextRequestIfAny()
     {
         while (count($this->pending) > 0 && count($this->running) < $this->maxParallelRequests) {
             $next = array_shift($this->pending);
@@ -180,15 +139,39 @@ class CurlAsync
         }
     }
 
-    protected function rejectAllPendingRequests()
+    public function rejectAllPendingRequests($reasonOrError = null)
     {
-        foreach ($this->running as $resourceNum => $deferred) {
-            unset($this->curl[$resourceNum]);
-            $deferred->reject();
+        $this->rejectAllRunningRequests($reasonOrError);
+    }
+
+    protected function rejectAllRunningRequests($reasonOrError = null)
+    {
+        $running = $this->running; // Hint: intentionally cloned
+        foreach ($running as $resourceNum => $deferred) {
+            $this->freeByResourceReference($resourceNum);
+            $deferred->reject($reasonOrError);
         }
-        $this->running = [];
-        foreach ($this->running as $resourceNum => $deferred) {
-            $deferred->reject();
+        if (! empty($this->running)) {
+            throw new RuntimeException(
+            // Hint: should never be reached
+                'All running requests should have been removed, but something has been left'
+            );
+        }
+    }
+
+    protected function rejectAllDeferredRequests($reasonOrError = null)
+    {
+        foreach ($this->pending as $pending) {
+            list($resourceNum, $deferred) = $pending;
+            $this->freeByResourceReference($resourceNum);
+            $deferred->reject($reasonOrError);
+        }
+
+        if (! empty($this->running)) {
+            throw new RuntimeException(
+            // Hint: should never be reached
+                'All pending requests should have been removed, but something has been left'
+            );
         }
     }
 
@@ -209,15 +192,15 @@ class CurlAsync
             // Hint: while ($status === CURLM_CALL_MULTI_PERFORM) ?
 
             if ($status !== CURLM_OK) {
-                return false; // Fail? New curl_multi_init()? Does this ever happen?
+                throw new RuntimeException(curl_multi_strerror($handle));
             }
             if ($active) {
                 $fds = curl_multi_select($handle, 0.01);
                 // We take no action here, we'll info_read anyways:
                 // $fds === -1 ->  select failed, returning. Probably only happens when running out of FDs
                 // $fds === 0  ->  Nothing to do
+                // TODO: figure how often we get here -> https://bugs.php.net/bug.php?id=61141
             }
-
             $gotResult = false;
             while (false !== ($completed = curl_multi_info_read($handle))) {
                 $this->requestCompleted($handle, $completed);
@@ -234,16 +217,26 @@ class CurlAsync
     protected function requestCompleted($handle, $completed)
     {
         $curl = $completed['handle'];
-        $resourceNum = (int) $curl;
+        $resourceNum = (int) $curl; // Hint this is an object in PHP >= 8, a resource in older versions
         $deferred = $this->running[$resourceNum];
-        unset($this->running[$resourceNum]);
-        unset($this->curl[$resourceNum]);
+        $request = $this->pendingRequests[$resourceNum];
         $content = curl_multi_getcontent($curl);
         curl_multi_remove_handle($handle, $curl);
+        $this->freeByResourceReference($resourceNum);
+
         if ($completed['result'] === CURLE_OK) {
-            $deferred->resolve(Message::parseResponse($content));
+            try {
+                $deferred->resolve(Message::parseResponse($content));
+            } catch (\Exception $e) {
+                $deferred->reject(new ResponseParseError($e->getMessage(), $request, null, $e->getCode(), $e));
+            }
         } else {
-            $deferred->reject(new \Exception(curl_error($curl)));
+            try {
+                $response = Message::parseResponse($content);
+            } catch (\Exception $e) {
+                $response = null;
+            }
+            $deferred->reject(new RequestError(curl_error($curl), $request, $response));
         }
     }
 
@@ -257,11 +250,11 @@ class CurlAsync
     {
         if ($interval !== $this->fastInterval) {
             $this->fastInterval = $interval;
-            $this->eventuallyReEnableTimer();
+            $this->reEnableTimerIfActive();
         }
     }
 
-    protected function eventuallyReEnableTimer()
+    protected function reEnableTimerIfActive()
     {
         if ($this->fastTimer !== null) {
             $this->disablePolling();
@@ -277,7 +270,7 @@ class CurlAsync
         if ($this->fastTimer === null) {
             $this->fastTimer = $this->loop->addPeriodicTimer($this->fastInterval, function () {
                 if ($this->checkForResults()) {
-                    $this->eventuallyEnqueueNextRequest();
+                    $this->enqueueNextRequestIfAny();
                 }
             });
         }
@@ -289,6 +282,14 @@ class CurlAsync
             $this->loop->cancelTimer($this->fastTimer);
             $this->fastTimer = null;
         }
+    }
+
+    protected function freeByResourceReference($ref)
+    {
+        unset($this->pendingRequests[$ref]);
+        unset($this->running[$ref]);
+        curl_close($this->curl[$ref]);
+        unset($this->curl[$ref]);
     }
 
     public function __destruct()
