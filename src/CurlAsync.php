@@ -2,6 +2,7 @@
 
 namespace gipfl\Curl;
 
+use Exception;
 use GuzzleHttp\Psr7\Message;
 use GuzzleHttp\Psr7\Request;
 use Psr\Http\Message\RequestInterface;
@@ -9,6 +10,7 @@ use React\EventLoop\LoopInterface;
 use React\EventLoop\TimerInterface;
 use React\Promise\Deferred;
 use RuntimeException;
+use Throwable;
 use function array_shift;
 use function count;
 use function curl_close;
@@ -222,9 +224,9 @@ class CurlAsync
         $request = $this->pendingRequests[$resourceNum];
         $content = curl_multi_getcontent($curl);
         curl_multi_remove_handle($handle, $curl);
-        $this->freeByResourceReference($resourceNum);
 
         if ($completed['result'] === CURLE_OK) {
+            $this->freeByResourceReference($resourceNum);
             try {
                 $deferred->resolve(Message::parseResponse($content));
             } catch (\Exception $e) {
@@ -236,7 +238,18 @@ class CurlAsync
             } catch (\Exception $e) {
                 $response = null;
             }
-            $deferred->reject(new RequestError(curl_error($curl), $request, $response));
+            try {
+                $error = curl_error($curl);
+                if ($error === '') {
+                    $error = 'Curl failed, but got no CURL error';
+                }
+            } catch (Throwable $e) {
+                $error = 'Unable to determine CURL error: ' . $e->getMessage();
+            } catch (Exception $e) {
+                $error = 'Unable to determine CURL error: ' . $e->getMessage();
+            }
+            $deferred->reject(new RequestError($error, $request, $response));
+            $this->freeByResourceReference($resourceNum);
         }
     }
 
