@@ -46,6 +46,9 @@ class CurlAsync
     /** @var [ [0 => resourceIdx, 1 => Deferred], ... ] */
     protected $pending = [];
 
+    /** @var array[] resourceIdx => options */
+    protected $pendingOptions = [];
+
     /** @var RequestInterface[] resourceIdx => RequestInterface */
     protected $pendingRequests = [];
 
@@ -100,6 +103,7 @@ class CurlAsync
         $curl = CurlHandle::createForRequest($request, $curlOptions);
         $idx = (int) $curl;
         $this->curl[$idx] = $curl;
+        $this->pendingOptions[$idx] = $curlOptions;
         $this->pendingRequests[$idx] = $request;
         $deferred = new Deferred(function () use ($idx) {
             $this->freeByResourceReference($idx);
@@ -222,19 +226,24 @@ class CurlAsync
         $resourceNum = (int) $curl; // Hint this is an object in PHP >= 8, a resource in older versions
         $deferred = $this->running[$resourceNum];
         $request = $this->pendingRequests[$resourceNum];
+        $options = $this->pendingOptions[$resourceNum];
         $content = curl_multi_getcontent($curl);
         curl_multi_remove_handle($handle, $curl);
+        $removeProxyHeaders = isset($options[CURLOPT_PROXYTYPE])
+            && $options[CURLOPT_PROXYTYPE] === CURLPROXY_HTTP
+            // We assume that CURLOPT_SUPPRESS_CONNECT_HEADERS has been set for the request
+            && !defined('CURLOPT_SUPPRESS_CONNECT_HEADERS');
 
         if ($completed['result'] === CURLE_OK) {
             $this->freeByResourceReference($resourceNum);
             try {
-                $deferred->resolve(Message::parseResponse($content));
+                $deferred->resolve($this->parseResponse($content, $removeProxyHeaders));
             } catch (\Exception $e) {
                 $deferred->reject(new ResponseParseError($e->getMessage(), $request, null, $e->getCode(), $e));
             }
         } else {
             try {
-                $response = Message::parseResponse($content);
+                $deferred->resolve($this->parseResponse($content, $removeProxyHeaders));
             } catch (\Exception $e) {
                 $response = null;
             }
@@ -251,6 +260,22 @@ class CurlAsync
             $deferred->reject(new RequestError($error, $request, $response));
             $this->freeByResourceReference($resourceNum);
         }
+    }
+
+    protected function parseResponse($content, $stripProxyHeaders)
+    {
+        // This method can be removed once we support PHP 7.3+ only, as it
+        // has CURLOPT_SUPPRESS_CONNECT_HEADERS
+        $response = Message::parseResponse($content);
+        if ($stripProxyHeaders) {
+            $body = (string) $response->getBody();
+            if (preg_match('/^HTTP\/.*? [0-9]{3}[^\n]*\r?\n/s', $body)) {
+                // There is no such header on reused connections
+                $response = Message::parseResponse($body);
+            }
+        }
+
+        return $response;
     }
 
     /**
@@ -300,6 +325,7 @@ class CurlAsync
     protected function freeByResourceReference($ref)
     {
         unset($this->pendingRequests[$ref]);
+        unset($this->pendingOptions[$ref]);
         unset($this->running[$ref]);
         curl_close($this->curl[$ref]);
         unset($this->curl[$ref]);

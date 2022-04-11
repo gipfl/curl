@@ -60,6 +60,12 @@ class CurlHandle
         } else {
             $opts[CURLOPT_HTTPHEADER] = $headers;
         }
+        if (isset($opts[CURLOPT_PROXYTYPE])
+            && $opts[CURLOPT_PROXYTYPE] === CURLPROXY_HTTP
+            && defined('CURLOPT_SUPPRESS_CONNECT_HEADERS')
+        ) {
+            $opts[CURLOPT_SUPPRESS_CONNECT_HEADERS] = true;
+        }
 
         if ($body !== null) {
             $opts[CURLOPT_POSTFIELDS] = $body;
